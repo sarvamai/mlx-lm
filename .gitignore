@@ -152,3 +152,8 @@ mlx_model/config.json
 mlx_model/generation_config.json
 mlx_model/model.safetensors.index.json
 mlx_model/model.safetensors
+
+sov-30b-bf16/
+sov-30b-fp8/
+sarvam_moe-mxfp4
+ckpt-28232/
