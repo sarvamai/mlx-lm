@@ -272,6 +272,57 @@ class SarvamMoEAttention(nn.Module):
 
 
 
+@mx.compile
+def _topk_fn(x: mx.array, k: int):
+    inds = mx.argpartition(x, kth=-k, axis=-1)[..., -k:]
+    vals = mx.take_along_axis(x, inds, axis=-1)
+    # Sort by score desc
+    order = mx.argsort(vals, axis=-1)[..., ::-1]
+    inds = mx.take_along_axis(inds, order, axis=-1)
+    vals = mx.take_along_axis(vals, order, axis=-1)
+    return inds, vals
+
+@mx.compile
+def _group_limited_topk_fn(scores: mx.array, n_group: int, top_k: int, topk_group: int):
+    if n_group == 1:
+        return _topk_fn(scores, top_k)
+    
+    num_tokens, num_experts = scores.shape
+    group_scores = scores.reshape(num_tokens, n_group, -1)
+    # Sum of top 2 in each group
+    # mx.topk returns values directly (unsorted, but sum doesn't care)
+    top2_vals = mx.topk(group_scores, k=2, axis=-1)
+    group_score_sums = top2_vals.sum(axis=-1)
+    
+    # Select topk groups
+    # We need indices here, so we use _topk (which wraps argpartition+sort)
+    group_idx, _ = _topk_fn(group_score_sums, topk_group)
+    
+    # Create mask
+    # Reference: group_mask.scatter_(1, group_idx, 1)
+    # MLX supports scatter via advanced indexing
+    group_mask = mx.zeros((num_tokens, n_group), dtype=scores.dtype)
+    # [B, Kg] indices
+    batch_col = mx.arange(num_tokens)[:, None]
+    group_mask[batch_col, group_idx] = 1 # Set selected groups to 1
+    
+    # Expand mask to experts: [B, n_group] -> [B, n_group, 1] -> broadcast
+    # experts_per_group implied by reshape
+    experts_per_group = num_experts // n_group
+    
+    # We can reshape mask to [B, num_experts] by repeating elements?
+    # group_mask: [B, G]. We want [B, G * E_per_G] where each expert in group G gets mask[g]
+    score_mask = mx.repeat(group_mask[:, :, None], experts_per_group, axis=2)
+    score_mask = score_mask.reshape(num_tokens, num_experts)
+    
+    # Apply mask
+    neg_inf = -1e9
+    masked_scores = mx.where(score_mask > 0, scores, neg_inf)
+    
+    # Final global topk
+    return _topk_fn(masked_scores, top_k)
+
+
 class SarvamMoEGate(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -294,54 +345,6 @@ class SarvamMoEGate(nn.Module):
         else:
             self.expert_bias = None
 
-    def _topk(self, x: mx.array, k: int):
-        inds = mx.argpartition(x, kth=-k, axis=-1)[..., -k:]
-        vals = mx.take_along_axis(x, inds, axis=-1)
-        # Sort by score desc
-        order = mx.argsort(vals, axis=-1)[..., ::-1]
-        inds = mx.take_along_axis(inds, order, axis=-1)
-        vals = mx.take_along_axis(vals, order, axis=-1)
-        return inds, vals
-
-    def group_limited_topk(self, scores: mx.array):
-        if self.n_group == 1:
-            return self._topk(scores, self.top_k)
-        
-        num_tokens, num_experts = scores.shape
-        group_scores = scores.reshape(num_tokens, self.n_group, -1)
-        # Sum of top 2 in each group
-        # mx.topk returns values directly (unsorted, but sum doesn't care)
-        top2_vals = mx.topk(group_scores, k=2, axis=-1)
-        group_score_sums = top2_vals.sum(axis=-1)
-        
-        # Select topk groups
-        # We need indices here, so we use _topk (which wraps argpartition+sort)
-        group_idx, _ = self._topk(group_score_sums, k=self.topk_group)
-        
-        # Create mask
-        # Reference: group_mask.scatter_(1, group_idx, 1)
-        # MLX supports scatter via advanced indexing
-        group_mask = mx.zeros((num_tokens, self.n_group), dtype=scores.dtype)
-        # [B, Kg] indices
-        batch_col = mx.arange(num_tokens)[:, None]
-        group_mask[batch_col, group_idx] = 1 # Set selected groups to 1
-        
-        # Expand mask to experts: [B, n_group] -> [B, n_group, 1] -> broadcast
-        # experts_per_group implied by reshape
-        experts_per_group = num_experts // self.n_group
-        
-        # We can reshape mask to [B, num_experts] by repeating elements?
-        # group_mask: [B, G]. We want [B, G * E_per_G] where each expert in group G gets mask[g]
-        score_mask = mx.repeat(group_mask[:, :, None], experts_per_group, axis=2)
-        score_mask = score_mask.reshape(num_tokens, num_experts)
-        
-        # Apply mask
-        neg_inf = -1e9
-        masked_scores = mx.where(score_mask > 0, scores, neg_inf)
-        
-        # Final global topk
-        return self._topk(masked_scores, self.top_k)
-
     def __call__(self, x: mx.array):
         # x: [B, L, H], weight: [E, H]
         # logits: [B, L, E] = x @ weight.T
@@ -359,7 +362,7 @@ class SarvamMoEGate(nn.Module):
         scores_flat = scores_for_routing.reshape(-1, E)
         
         # Routing
-        inds_flat, _ = self.group_limited_topk(scores_flat)
+        inds_flat, _ = _group_limited_topk_fn(scores_flat, self.n_group, self.top_k, self.topk_group)
         
         # Reshape back to [B, L, k]
         inds = inds_flat.reshape(B, L, self.top_k)
