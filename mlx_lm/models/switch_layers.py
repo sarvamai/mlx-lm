@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+git config pull.rebase true# Copyright © 2023-2024 Apple Inc.
 
 import math
 from functools import partial
