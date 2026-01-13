@@ -9,6 +9,12 @@ __pycache__/
 # Vim
 *.swp
 
+ckpt-*/*
+
+sov-30b-fp8/*
+sov-30b-bf16/*
+sarvam_moe-mxfp4/*
+
 # Distribution / packaging
 .Python
 build/
