@@ -3,6 +3,7 @@
 import argparse
 import copy
 import time
+import json
 import types
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import numpy as np
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from mlx_lm.tuner.datasets import load_dataset
+from mlx_lm.tuner.datasets import create_dataset, load_dataset
 from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 from mlx_lm.tuner.utils import print_trainable_parameters
@@ -216,16 +217,32 @@ def load_data(
     max_seq_length: int,
     num_valid_samples: int = 32,
 ):
-    args = types.SimpleNamespace(
-        hf_dataset={
-            "path": data_path,
-            "train_split": "train",
-            "valid_split": "train[:1]",
-        },
-        train=True,
-        test=False,
-    )
-    dataset = load_dataset(args, tokenizer)[0]
+    path = Path(data_path)
+    if path.exists():
+        if path.is_file():
+            with open(path, "r") as f:
+                data = [json.loads(l) for l in f]
+            args = types.SimpleNamespace()
+            dataset = create_dataset(data, tokenizer, args)
+        else:
+            args = types.SimpleNamespace(
+                data=path,
+                train=True,
+                test=False,
+                hf_dataset=False,
+            )
+            dataset = load_dataset(args, tokenizer)[0]
+    else:
+        args = types.SimpleNamespace(
+            hf_dataset={
+                "path": data_path,
+                "train_split": "train",
+                "valid_split": "train[:1]",
+            },
+            train=True,
+            test=False,
+        )
+        dataset = load_dataset(args, tokenizer)[0]
     perm = np.random.permutation(len(dataset))
     train_perm = perm[:num_samples].tolist()
     valid_perm = perm[num_samples : num_samples + num_valid_samples].tolist()

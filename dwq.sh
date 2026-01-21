@@ -13,7 +13,8 @@ python3 -m mlx_lm quant.dwq \
   --model ckpt_path \
   --bits 4 \
   --group-size 64 \
-  --mlx-path sarvam_moe-dwq \
+  --mlx-path sarvam_moe_sft_train-dwq \
+  --data-path train.jsonl \
   --num-samples 128 \
   --batch-size 1 \
   --max-seq-length 256 \
