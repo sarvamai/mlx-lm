@@ -908,18 +908,12 @@ def _make_cache(model, left_padding):
 def _merge_caches(caches):
     batch_cache = []
     for i in range(len(caches[0])):
-        cache = None
-        if isinstance(caches[0][i], KVCache):
-            cache = BatchKVCache.merge([c[i] for c in caches])
-        elif isinstance(caches[0][i], RotatingKVCache):
-            cache = BatchRotatingKVCache.merge([c[i] for c in caches])
-        elif isinstance(caches[0][i], ArraysCache):
-            cache = ArraysCache.merge([c[i] for c in caches])
+        if hasattr(caches[0][i], "merge"):
+            batch_cache.append(caches[0][i].merge([c[i] for c in caches]))
         else:
             raise ValueError(
                 f"{type(caches[0][i])} does not yet support batching with history"
             )
-        batch_cache.append(cache)
     return batch_cache
 
 
@@ -1009,7 +1003,8 @@ class BatchGenerator:
             self.uid_count += 1
         # Sort in ascending order of length
         self.unprocessed_prompts = sorted(
-            self.unprocessed_prompts, key=lambda x: len(x[1]) + cache.cache_length(x[3])
+            self.unprocessed_prompts,
+            key=lambda x: len(x[1]) + max(c.size() for c in x[3]),
         )
         return uids
 
@@ -1029,10 +1024,6 @@ class BatchGenerator:
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
-        if hasattr(caches[0][0], "keys"):
-            cache_is_empty = all(c[0].keys is None for c in caches)
-        else:
-            cache_is_empty = all(c[0][0] is None for c in caches)
 
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
@@ -1046,7 +1037,7 @@ class BatchGenerator:
         # New prompts so
         #   1. Left-pad the inputs
         #   2. Process
-        if cache_is_empty:
+        if all(c[0].empty() for c in caches):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
             prompt_cache = _make_cache(self.model, padding)
 
@@ -1257,7 +1248,7 @@ class BatchGenerator:
 def batch_generate(
     model,
     tokenizer,
-    prompts: List[int],
+    prompts: List[List[int]],
     prompt_caches: Optional[List[List[Any]]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
@@ -1271,7 +1262,7 @@ def batch_generate(
     Args:
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
-       prompt (List[List[int]]): The input prompts.
+       prompts (List[List[int]]): The input prompts.
        prompt_caches (List[List[Any]], optional): Pre-computed prompt-caches
           for each input prompt. Note, unlike ``generate_step``, the caches
           won't be updated in-place.
