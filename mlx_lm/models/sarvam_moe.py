@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-from .base import BaseModelArgs, scaled_dot_product_attention
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
 
 
@@ -36,62 +36,6 @@ class SarvamMoECausalLMOutputWithPast:
     router_logits: Optional[Tuple[mx.array]] = None
 
 
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(axis=-1).astype(mx.int32)
-    # create indices from mask
-    # MLX boolean indexing is limited, use numpy/cpu fallback for this helper
-    mask_np = np.array(attention_mask.flatten())
-    indices_np = np.nonzero(mask_np)[0]
-    indices = mx.array(indices_np)
-    
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = mx.cumsum(seqlens_in_batch, axis=0).astype(mx.int32)
-    # Pad with 0
-    cu_seqlens = mx.concatenate([mx.array([0], dtype=mx.int32), cu_seqlens])
-    return indices, cu_seqlens, max_seqlen_in_batch
-
-
-def _make_causal_mask(
-    input_ids_shape: Tuple[int, int],
-    dtype: mx.Dtype,
-    past_key_values_length: int = 0,
-):
-    """
-    Make causal mask used for bi-directional self-attention.
-    """
-    bsz, tgt_len = input_ids_shape
-    mask = mx.full((tgt_len, tgt_len), -1e9, dtype=dtype)
-    mask = mx.triu(mask, k=1)
-    
-    if past_key_values_length > 0:
-        past_mask = mx.zeros((tgt_len, past_key_values_length), dtype=dtype)
-        mask = mx.concatenate([past_mask, mask], axis=-1)
-        
-    mask = mx.expand_dims(mask, axis=[0, 1])  # (1, 1, tgt_len, tgt_len + past_len)
-    return mask
-
-
-def _expand_mask(mask: mx.array, dtype: mx.Dtype, tgt_len: Optional[int] = None):
-    """
-    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
-    """
-    bsz, src_len = mask.shape
-    tgt_len = tgt_len if tgt_len is not None else src_len
-
-    expanded_mask = mask[:, None, None, :].astype(dtype)
-    
-    # Inverted mask: 1.0 where we want to attend, 0.0 where we don't.
-    # Usually in transformers: 1 is keep, 0 is mask. 
-    # And then (1.0 - mask) * min_value.
-    # However, create_attention_mask in MLX often expects additive mask (0 for keep, -inf for mask).
-    
-    # If the input mask is 1 for keep, 0 for discard:
-    inverted_mask = 1.0 - expanded_mask
-    
-    # If direct usage of min_dtype
-    # Check what SarvamMoE expected: It uses _prepare_4d_attention_mask which returns additive mask.
-    
-    return inverted_mask * -1e9
 
 
 
@@ -551,21 +495,9 @@ class SarvamMoEModel(nn.Module):
             cache = [None] * len(self.layers)
 
         mask = None
+        mask = None
         if h.shape[1] > 1:
-             # create mask for sequence using helpers
-             if cache is not None and cache[0] is not None:
-                 past_key_values_length = cache[0].offset
-             else:
-                 past_key_values_length = 0
-             
-             mask = _make_causal_mask(
-                 h.shape[:2], 
-                 dtype=h.dtype, 
-                 past_key_values_length=past_key_values_length
-             )
-             # Expand to batch size if needed by broadcasting, but _make_causal_mask returns (1, 1, L, L) usually
-             # or we might need to handle specific logic if we want to match exact torch behavior.
-             # _make_causal_mask above creates (1, 1, L, L), so it broadcasts.
+            mask = create_attention_mask(h, cache)
 
         all_router_logits = [] if output_router_logits else None
 
