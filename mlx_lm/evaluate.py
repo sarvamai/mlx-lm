@@ -82,6 +82,7 @@ class MLXLM(LM):
         use_chat_template: Optional[bool] = None,
         trust_remote_code: bool = False,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
+        max_thinking_tokens: Optional[int] = None,
     ) -> None:
         super().__init__()
         tokenizer_config = {"trust_remote_code": True if trust_remote_code else None}
@@ -89,6 +90,7 @@ class MLXLM(LM):
             path_or_hf_repo, tokenizer_config=tokenizer_config
         )
         self._max_tokens = max_tokens
+        self._max_thinking_tokens = max_thinking_tokens
         self._batch_size = 8
         self.use_chat_template = use_chat_template
         if use_chat_template is None:
@@ -349,6 +351,7 @@ class MLXLM(LM):
             max_tokens=max_tokens,
             verbose=True,
             sampler=self._sampler,
+            max_thinking_tokens=self._max_thinking_tokens,
         ).texts
 
         for e, (text, opt) in enumerate(zip(completions, options)):
@@ -452,6 +455,12 @@ def main():
     parser.add_argument("--temp", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
     parser.add_argument("--top-k", type=int, default=0, help="Sampling top-k")
+    parser.add_argument(
+        "--max-thinking-tokens",
+        type=int,
+        default=None,
+        help="Maximum tokens allowed in <think>...</think> block. Forces </think> when exceeded.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -479,6 +488,7 @@ def main():
         use_chat_template=args.apply_chat_template,
         trust_remote_code=args.trust_remote_code,
         sampler=sampler,
+        max_thinking_tokens=args.max_thinking_tokens,
     )
     MLXLM.apply_chat_template = chat_template_fn(**args.chat_template_args)
 

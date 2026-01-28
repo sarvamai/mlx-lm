@@ -643,6 +643,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    max_thinking_tokens: Optional[int] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -658,6 +659,10 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        max_thinking_tokens (Optional[int]): Maximum number of tokens allowed
+          inside a ``<think>...</think>`` block. When exceeded, the generator
+          forces a ``</think>`` token to end the thinking phase. Default: ``None``
+          (no limit).
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -681,6 +686,13 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
+    # Thinking token budget tracking
+    in_thinking = False
+    thinking_token_count = 0
+    think_start_id = getattr(tokenizer, "think_start_id", None)
+    think_end_id = getattr(tokenizer, "think_end_id", None)
+    has_thinking_support = think_start_id is not None and think_end_id is not None
+
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
@@ -701,6 +713,26 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
+
+            # Track thinking tokens and enforce budget
+            if has_thinking_support and max_thinking_tokens is not None:
+                if token == think_start_id:
+                    in_thinking = True
+                    thinking_token_count = 0
+                elif token == think_end_id:
+                    in_thinking = False
+                    thinking_token_count = 0
+                elif in_thinking:
+                    thinking_token_count += 1
+                    # Force </think> token when budget exceeded
+                    if thinking_token_count >= max_thinking_tokens:
+                        token = think_end_id
+                        in_thinking = False
+                        thinking_token_count = 0
+                        # Update logprobs to reflect forced token
+                        logprobs = mx.zeros_like(logprobs)
+                        logprobs[think_end_id] = 0.0
+
             if token in tokenizer.eos_token_ids:
                 break
 
@@ -844,6 +876,9 @@ class Batch:
     samplers: List[Any]
     logits_processors: List[Any]
     tokens: List[mx.array]
+    # Thinking budget tracking per-prompt
+    in_thinking_state: Optional[List[bool]] = None
+    thinking_token_counts: Optional[List[int]] = None
 
     def __len__(self):
         return len(self.uids)
@@ -856,6 +891,10 @@ class Batch:
         self.samplers = [self.samplers[k] for k in keep_idx]
         self.logits_processors = [self.logits_processors[k] for k in keep_idx]
         self.tokens = [self.tokens[k] for k in keep_idx]
+        if self.in_thinking_state is not None:
+            self.in_thinking_state = [self.in_thinking_state[k] for k in keep_idx]
+        if self.thinking_token_counts is not None:
+            self.thinking_token_counts = [self.thinking_token_counts[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
         for c in self.cache:
@@ -870,6 +909,10 @@ class Batch:
         self.samplers.extend(other.samplers)
         self.logits_processors.extend(other.logits_processors)
         self.tokens.extend(other.tokens)
+        if self.in_thinking_state is not None and other.in_thinking_state is not None:
+            self.in_thinking_state.extend(other.in_thinking_state)
+        if self.thinking_token_counts is not None and other.thinking_token_counts is not None:
+            self.thinking_token_counts.extend(other.thinking_token_counts)
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
@@ -947,6 +990,9 @@ class BatchGenerator:
         prompt_progress_callback: Optional[
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
+        max_thinking_tokens: Optional[int] = None,
+        think_start_id: Optional[int] = None,
+        think_end_id: Optional[int] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -960,6 +1006,16 @@ class BatchGenerator:
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
+
+        # Thinking budget settings
+        self.max_thinking_tokens = max_thinking_tokens
+        self.think_start_id = think_start_id
+        self.think_end_id = think_end_id
+        self.has_thinking_support = (
+            max_thinking_tokens is not None
+            and think_start_id is not None
+            and think_end_id is not None
+        )
 
         self.active_batch = None
 
@@ -1114,6 +1170,8 @@ class BatchGenerator:
             list(samplers),
             list(logits_processors),
             tokens,
+            in_thinking_state=[False] * len(uids) if self.has_thinking_support else None,
+            thinking_token_counts=[0] * len(uids) if self.has_thinking_support else None,
         )
 
     def _step(
@@ -1223,6 +1281,24 @@ class BatchGenerator:
         for e, (t, uid, num_tok, max_tok) in enumerate(
             zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
         ):
+            # Track thinking tokens and enforce budget
+            if self.has_thinking_support:
+                if t == self.think_start_id:
+                    batch.in_thinking_state[e] = True
+                    batch.thinking_token_counts[e] = 0
+                elif t == self.think_end_id:
+                    batch.in_thinking_state[e] = False
+                    batch.thinking_token_counts[e] = 0
+                elif batch.in_thinking_state[e]:
+                    batch.thinking_token_counts[e] += 1
+                    # Force </think> token when budget exceeded
+                    if batch.thinking_token_counts[e] >= self.max_thinking_tokens:
+                        t = self.think_end_id
+                        batch.in_thinking_state[e] = False
+                        batch.thinking_token_counts[e] = 0
+                        # Update y list with forced token
+                        y[e] = t
+
             cache = None
             num_tok += 1
             batch.num_tokens[e] = num_tok
@@ -1263,6 +1339,7 @@ def batch_generate(
     verbose: bool = False,
     return_prompt_caches: bool = False,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    max_thinking_tokens: Optional[int] = None,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1283,13 +1360,23 @@ def batch_generate(
           responses. Default: ``False``.
        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
           A list of functions that take tokens and logits and return the processed logits. Default: ``None``.
+       max_thinking_tokens (Optional[int]): Maximum number of tokens allowed inside
+          a ``<think>...</think>`` block. When exceeded, forces ``</think>``.
+          Default: ``None`` (no limit).
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
 
+    # Get thinking token IDs from tokenizer if available
+    think_start_id = getattr(tokenizer, "think_start_id", None)
+    think_end_id = getattr(tokenizer, "think_end_id", None)
+
     gen = BatchGenerator(
         model,
         stop_tokens=tokenizer.eos_token_ids,
+        max_thinking_tokens=max_thinking_tokens,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
         **kwargs,
     )
     num_samples = len(prompts)
