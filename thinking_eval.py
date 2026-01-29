@@ -1,3 +1,4 @@
+import argparse
 import polars as pl
 import re
 from tqdm import tqdm
@@ -9,7 +10,11 @@ from mlx_lm import load, generate, batch_generate
 # ============================================================
 # Config
 # ============================================================
-MODEL_PATH = "/Users/rachittibrewal/Documents/airllm/sarvam_moe_sft-dwq"
+parser = argparse.ArgumentParser(description="Evaluate model on MMLU abstract algebra with thinking budget")
+parser.add_argument("--model", type=str, default="/Users/rachittibrewal/Documents/airllm/sarvam_moe_sft-dwq", help="Path to the model to evaluate")
+args = parser.parse_args()
+
+MODEL_PATH = args.model
 
 BATCH_SIZE = 16           # safe for 4B on M2/M3
 THINKING_BUDGET = 512     # max tokens allowed for reasoning
@@ -84,6 +89,7 @@ def extract_answer(text: str):
 # ============================================================
 # Load model
 # ============================================================
+print(f"Loading model from: {MODEL_PATH}")
 model, tokenizer = load(
     MODEL_PATH,
     tokenizer_config={"trust_remote_code": True},
