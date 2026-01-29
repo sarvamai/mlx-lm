@@ -505,6 +505,8 @@ class SarvamMoEModel(nn.Module):
         start = 0
         if cache and cache[0] is not None:
              start = cache[0].offset
+             if isinstance(start, mx.array):
+                 start = start.item()
         L = h.shape[1]
         position_ids = mx.arange(start, start + L).reshape(1, -1)
         
