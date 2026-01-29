@@ -456,10 +456,10 @@ def main():
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
     parser.add_argument("--top-k", type=int, default=0, help="Sampling top-k")
     parser.add_argument(
-        "--max-thinking-tokens",
-        type=int,
-        default=None,
-        help="Maximum tokens allowed in <think>...</think> block. Forces </think> when exceeded.",
+        "--gen-kwargs",
+        type=json.loads,
+        help="""A JSON formatted string of arguments for the generation, e.g. '{"max_tokens": 256, "stop": ["\\n\\n"]}'""",
+        default="{}",
     )
     args = parser.parse_args()
 
@@ -504,6 +504,7 @@ def main():
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
         confirm_run_unsafe_code=args.confirm_run_unsafe_code,
+        gen_kwargs=args.gen_kwargs,
     )
 
     file_keys = ["eval", args.model.replace("/", "_"), version("lm_eval")]

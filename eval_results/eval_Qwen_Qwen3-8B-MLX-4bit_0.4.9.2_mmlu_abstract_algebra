@@ -1,0 +1,7 @@
+{
+    "mmlu_abstract_algebra": {
+        "alias": "abstract_algebra",
+        "acc,none": 0.0,
+        "acc_stderr,none": 0.0
+    }
+}
