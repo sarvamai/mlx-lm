@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 import mlx.core as mx
 from mlx_lm import load, generate, batch_generate
+from mlx_lm.sample_utils import make_sampler
 
 
 # ============================================================
@@ -13,15 +14,19 @@ from mlx_lm import load, generate, batch_generate
 parser = argparse.ArgumentParser(description="Evaluate model on MMLU abstract algebra with thinking budget")
 parser.add_argument("--model", type=str, default="/Users/rachittibrewal/Documents/airllm/sarvam_moe_sft-dwq", help="Path to the model to evaluate")
 parser.add_argument("--output-file", type=str, default=None, help="Path to save output results JSONL")
+parser.add_argument("--batch-size", type=int, default=2, help="Batch size for evaluation")
+parser.add_argument("--thinking-budget", type=int, default=256, help="Max tokens allowed for reasoning")
+parser.add_argument("--answer-budget", type=int, default=64, help="Max tokens allowed for answer")
+parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
 args = parser.parse_args()
 
 MODEL_PATH = args.model
 OUTPUT_FILE = args.output_file
 
-BATCH_SIZE = 16           # safe for 4B on M2/M3
-THINKING_BUDGET = 512     # max tokens allowed for reasoning
-ANSWER_BUDGET = 256        # answer-only tokens
-TEMPERATURE = 0.0
+BATCH_SIZE = args.batch_size
+THINKING_BUDGET = args.thinking_budget
+ANSWER_BUDGET = args.answer_budget
+TEMPERATURE = args.temperature
 
 mx.random.seed(0)
 
@@ -75,7 +80,7 @@ def enforce_think_close(text: str) -> str:
     # Truncate any runaway thinking and hard-close
     if "</think>" in text:
         text = text.split("</think>")[0]
-    return text.rstrip() + "\n</think>\nThe correct answer is option"
+    return text.rstrip() + "\n</think>\n<answer>"
 
 
 # ============================================================
@@ -84,8 +89,17 @@ def enforce_think_close(text: str) -> str:
 ANSWER_RE = re.compile(r"^\s*([ABCD])", re.IGNORECASE)
 
 def extract_answer(text: str):
+    # Try to find A, B, C, D at the very start of generation
+    # since we end the prompt with <answer>
     m = ANSWER_RE.search(text)
-    return m.group(1).upper() if m else None
+    if m:
+        return m.group(1).upper()
+    
+    # Fallback: Look for <answer>([ABCD]) pattern if it somehow completed the tag itself
+    m = re.search(r"<answer>\s*([ABCD])", text, re.IGNORECASE)
+    if m:
+         return m.group(1).upper()
+    return None
 
 
 # ============================================================
@@ -114,11 +128,13 @@ for i in tqdm(range(0, len(rows), BATCH_SIZE)):
     # --------------------------------------------------------
     # Pass 1: Thinking (hard budget)
     # --------------------------------------------------------
+    sampler = make_sampler(TEMPERATURE)
     thinking_response = batch_generate(
         model,
         tokenizer,
         [tokenizer.encode(p) for p in prompts],
         max_tokens=THINKING_BUDGET,
+        sampler=sampler,
         verbose=False,
     )
     thinking_outputs = thinking_response.texts
@@ -134,6 +150,7 @@ for i in tqdm(range(0, len(rows), BATCH_SIZE)):
         tokenizer,
         [tokenizer.encode(p) for p in answer_prompts],
         max_tokens=ANSWER_BUDGET,
+        sampler=sampler,
         verbose=False,
     )
     answer_outputs = answer_response.texts
