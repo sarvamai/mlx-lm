@@ -18,6 +18,8 @@ parser.add_argument("--batch-size", type=int, default=2, help="Batch size for ev
 parser.add_argument("--thinking-budget", type=int, default=256, help="Max tokens allowed for reasoning")
 parser.add_argument("--answer-budget", type=int, default=64, help="Max tokens allowed for answer")
 parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
+parser.add_argument("--kv-bits", type=int, default=None, help="KV cache quantization bits")
+parser.add_argument("--kv-group-size", type=int, default=64, help="KV cache quantization group size")
 args = parser.parse_args()
 
 MODEL_PATH = args.model
@@ -136,6 +138,8 @@ for i in tqdm(range(0, 20, BATCH_SIZE)):
         max_tokens=THINKING_BUDGET,
         sampler=sampler,
         verbose=False,
+        kv_bits=args.kv_bits,
+        kv_group_size=args.kv_group_size,
     )
     thinking_outputs = thinking_response.texts
 

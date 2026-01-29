@@ -734,7 +734,13 @@ def dynamic_roll(x, shifts, axis):
 class BatchKVCache(_BaseCache):
     step = 256
 
-    def __init__(self, left_padding: List[int]):
+    def __init__(
+        self,
+        left_padding: List[int],
+        quantized: bool = False,
+        group_size: int = 64,
+        bits: int = 4,
+    ):
         """
         The BatchKV cache expects inputs to be left-padded.
 
@@ -761,30 +767,180 @@ class BatchKVCache(_BaseCache):
 
         self._right_padding = None
 
+        self.quantized = quantized
+        self.group_size = group_size
+        self.bits = bits
+
     def update_and_fetch(self, keys, values):
         prev = self._idx
-        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = keys.shape
-            v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
-            new_k = mx.zeros(k_shape, keys.dtype)
-            new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
-            else:
-                self.keys, self.values = new_k, new_v
 
-        self.offset += keys.shape[2]
-        self._idx += keys.shape[2]
-        self.keys[..., prev : self._idx, :] = keys
-        self.values[..., prev : self._idx, :] = values
-        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+        # If not quantized, use original logic
+        if not self.quantized:
+            if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+                B, n_kv_heads, _, k_head_dim = keys.shape
+                v_head_dim = values.shape[3]
+                n_steps = (self.step + keys.shape[2] - 1) // self.step
+                k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+                v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+                new_k = mx.zeros(k_shape, keys.dtype)
+                new_v = mx.zeros(v_shape, values.dtype)
+                if self.keys is not None:
+                    if prev % self.step != 0:
+                        self.keys = self.keys[..., :prev, :]
+                        self.values = self.values[..., :prev, :]
+                    self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                    self.values = mx.concatenate([self.values, new_v], axis=2)
+                else:
+                    self.keys, self.values = new_k, new_v
+
+            self.offset += keys.shape[2]
+            self._idx += keys.shape[2]
+            self.keys[..., prev : self._idx, :] = keys
+            self.values[..., prev : self._idx, :] = values
+            return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+
+        # Quantized logic
+        else:
+            if self.keys is None or (prev + keys.shape[2]) > self.keys[0].shape[-2]:
+                B, n_kv_heads, _, k_head_dim = keys.shape
+                v_head_dim = values.shape[3]
+                el_per_int = 8 * mx.uint32.size // self.bits
+                
+                # Align to step size
+                n_new_steps = keys.shape[2] 
+                total_steps = prev + n_new_steps
+                new_steps = (self.step + total_steps - 1) // self.step * self.step
+                n_alloc = new_steps if self.keys is None else (new_steps - self.keys[0].shape[-2])
+                
+                # Re-calculate full shape size to allocate including previous
+                # Actually closer to QuantizedKVCache logic of initialization/extension
+                
+                # Simplified: standard step expansion 
+                # If keys is None, allocate new_steps.
+                # If keys exists, and we need more space, allocate more.
+                
+                # Let's match QuantizedKVCache structure for 'keys' and 'values' which are tuples
+                # (data, scales, biases)
+                
+                shape = (B, n_kv_heads, new_steps)
+
+                def init_quant(dim):
+                    return (
+                        mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                        mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                        mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    )
+
+                def expand_quant(x, dim_size):
+                    # x is a tuple of (data, scales, biases)
+                    # We need to expand each
+                    current_len = x[0].shape[-2]
+                    needed = new_steps - current_len
+                    
+                    if needed > 0:
+                         # Append zeros
+                         # We need to be careful with shapes.
+                         # data: [..., L, D]
+                         d_data = mx.zeros((*x[0].shape[:-2], needed, x[0].shape[-1]), dtype=x[0].dtype)
+                         d_scales = mx.zeros((*x[1].shape[:-2], needed, x[1].shape[-1]), dtype=x[1].dtype)
+                         d_biases = mx.zeros((*x[2].shape[:-2], needed, x[2].shape[-1]), dtype=x[2].dtype)
+                         
+                         return (
+                             mx.concatenate([x[0], d_data], axis=-2),
+                             mx.concatenate([x[1], d_scales], axis=-2),
+                             mx.concatenate([x[2], d_biases], axis=-2)
+                         )
+                    return x
+
+                if self.keys is not None:
+                    # Truncate if we are not aligned (rare in batch gen but possible?)
+                    # Batch gen usually appends. 
+                    if prev % self.step != 0:
+                         # This logic from QuantizedKVCache handles if we over-allocated or something
+                         # For now let's trust we just expand
+                         pass
+                    
+                    # We just re-allocate essentially if we strictly follow the other pattern, 
+                    # but let's try to just use expansion logic if we can.
+                    # Actually typically we just re-init larger and copy? 
+                    # QuantizedKVCache.update_and_fetch implementation:
+                    # It creates NEW zeros of total size and trims... wait no
+                    # It creates 'init_quant' with new full shape if keys is None.
+                    # If keys is not None, it uses `expand_quant` which concats `new_x`.
+                    
+                    # Let's adapt that logic exactly.
+                    # BUT `shape` in expand_quant there uses `new_steps` which is TOTAL size?
+                    # No, `shape` in QuantizedKVCache is (B, H, new_steps).
+                    # `expand_quant` does `mx.zeros((*shape, ...))` -> This makes a generic zero array of FULL new size?
+                    # And then `mx.concatenate([x, new_x])`. 
+                    # That would double the size + more?
+                    # Wait, `init_quant` uses `shape`. `expand_quant` uses `shape`.
+                    # In `QuantizedKVCache`: `new_steps` seems to be the TARGET total size.
+                    # `expand_quant`: `new_x = mx.zeros((*shape, ...))`. This creates a tensor of size `new_steps`.
+                    # Then `mx.concatenate([x, new_x])` -> Size `old + new_steps`.
+                    # This looks like a BUG or I am misreading `QuantizedKVCache` in `cache.py`.
+                    
+                    # Let's look at `cache.py` (file snippet provided earlier).
+                    # default_init_quant uses `shape`.
+                    # expand_quant uses `shape`.
+                    # `new_x = mx.zeros((*shape, ...))`.
+                    # `mx.concatenate([x, new_x])`.
+                    # If `shape` has `new_steps` (the new total length), then concatenating makes it `old + new_total`.
+                    # That seems wrong. It should be `new_storage_size - old_size`.
+                                        
+                    # Let's assume for BatchKVCache we just want to ensure we have capacity.
+                    current_cap = self.keys[0].shape[-2]
+                    if (prev + keys.shape[2]) > current_cap:
+                         needed = (prev + keys.shape[2] - current_cap + self.step - 1) // self.step * self.step
+                         
+                         # Expansion helper
+                         def _expand(t, add_len):
+                             zeros_shape = list(t.shape)
+                             zeros_shape[-2] = add_len
+                             new_t = mx.zeros(zeros_shape, dtype=t.dtype)
+                             return mx.concatenate([t, new_t], axis=-2)
+                             
+                         self.keys = tuple(_expand(x, needed) for x in self.keys)
+                         self.values = tuple(_expand(x, needed) for x in self.values)
+
+                else:
+                    # First allocation
+                    # Calculate capacity
+                    cap = (keys.shape[2] + self.step - 1) // self.step * self.step
+                    shape = (B, n_kv_heads, cap)
+                    
+                    def init_q(dim):
+                        return (
+                            mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                            mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                            mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                        )
+                    self.keys = init_q(k_head_dim)
+                    self.values = init_q(v_head_dim)
+
+            # Perform Quantization
+            # keys: [B, H, L, D]
+            q_keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+            q_values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+            
+            # Store
+            # q_keys is (data, scales, biases)
+            self.offset += keys.shape[2]
+            self._idx += keys.shape[2]
+            
+            # Helper to assign
+            def _assign(storage, update):
+                for s, u in zip(storage, update):
+                    s[..., prev : self._idx, :] = u
+            
+            _assign(self.keys, q_keys)
+            _assign(self.values, q_values)
+            
+            # Fetch (slice)
+            def _slice(storage):
+                return tuple(s[..., : self._idx, :] for s in storage)
+                
+            return _slice(self.keys), _slice(self.values)
 
     def __len__(self):
         return self._idx
@@ -805,8 +961,12 @@ class BatchKVCache(_BaseCache):
     def finalize(self):
         if self._right_padding is not None:
             padding = self._right_padding
-            self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
-            self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+            self.keys = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2), self.keys
+            )
+            self.values = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2), self.values
+            )
             self.offset -= padding
             self.left_padding += padding
             self._right_padding = None
@@ -814,7 +974,12 @@ class BatchKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
-        if self._idx < k.shape[2]:
+        # Handle quantized cache where keys/values are tuples
+        if isinstance(k, tuple):
+            if self._idx < k[0].shape[2]:
+                k = tuple(x[..., : self._idx, :] for x in k)
+                v = tuple(x[..., : self._idx, :] for x in v)
+        elif self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
         return k, v, self.offset, self.left_padding

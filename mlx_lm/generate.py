@@ -920,15 +920,17 @@ class Batch:
         return [c.extract(idx) for c in self.cache]
 
 
-def _make_cache(model, left_padding):
+def _make_cache(model, left_padding, quantized=False, group_size=64, bits=4):
     """
     Convert a list of regular caches into their corresponding
     batch-aware caches.
     """
 
-    def to_batch_cache(c):
+    def to_batch_cache(c, quantized=False, group_size=64, bits=4):
         if type(c) is KVCache:
-            return BatchKVCache(left_padding)
+            return BatchKVCache(
+                left_padding, quantized=quantized, group_size=group_size, bits=bits
+            )
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -993,7 +995,11 @@ class BatchGenerator:
         max_thinking_tokens: Optional[int] = None,
         think_start_id: Optional[int] = None,
         think_end_id: Optional[int] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
     ):
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
         self.model = model
         self.unprocessed_prompts = []
         self.max_tokens = max_tokens
@@ -1104,7 +1110,13 @@ class BatchGenerator:
         #   2. Process
         if cache_is_empty:
             inputs = _left_pad_prompts(inputs, max_length=max_length)
-            prompt_cache = _make_cache(self.model, padding)
+            prompt_cache = _make_cache(
+                self.model,
+                padding,
+                quantized=self.kv_bits is not None,
+                group_size=self.kv_group_size,
+                bits=self.kv_bits or 4,
+            )
 
             while inputs.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
@@ -1340,6 +1352,8 @@ def batch_generate(
     return_prompt_caches: bool = False,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     max_thinking_tokens: Optional[int] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1360,11 +1374,14 @@ def batch_generate(
           responses. Default: ``False``.
        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
           A list of functions that take tokens and logits and return the processed logits. Default: ``None``.
-       max_thinking_tokens (Optional[int]): Maximum number of tokens allowed inside
-          a ``<think>...</think>`` block. When exceeded, forces ``</think>``.
-          Default: ``None`` (no limit).
-       kwargs: The remaining options get passed to :obj:`BatchGenerator`.
-          See :obj:`BatchGenerator` for more details.
+        max_thinking_tokens (Optional[int]): Maximum number of tokens allowed inside
+           a ``<think>...</think>`` block. When exceeded, forces ``</think>``.
+           Default: ``None`` (no limit).
+        kv_bits (int, optional): Number of bits to use for KV cache quantization.
+           None implies no cache quantization. Default: ``None``.
+        kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
+        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
+           See :obj:`BatchGenerator` for more details.
     """
 
     # Get thinking token IDs from tokenizer if available
@@ -1377,6 +1394,8 @@ def batch_generate(
         max_thinking_tokens=max_thinking_tokens,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
         **kwargs,
     )
     num_samples = len(prompts)
