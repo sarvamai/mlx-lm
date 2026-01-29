@@ -499,16 +499,19 @@ class SarvamMoEModel(nn.Module):
         if h.shape[1] > 1:
             mask = create_attention_mask(h, cache)
 
-        all_router_logits = [] if output_router_logits else None
-
         # position_ids: (1, L)
         start = 0
         if cache and cache[0] is not None:
              start = cache[0].offset
-             if isinstance(start, mx.array):
-                 start = start.item()
         L = h.shape[1]
-        position_ids = mx.arange(start, start + L).reshape(1, -1)
+        
+        if isinstance(start, mx.array) and start.ndim > 0:
+            # Batched offsets: (B,) -> (B, L)
+            position_ids = start[:, None] + mx.arange(L)[None, :]
+        else:
+            if isinstance(start, mx.array):
+                 start = start.item()
+            position_ids = mx.arange(start, start + L).reshape(1, -1)
         
         cos, sin = self.rotary_emb(h, position_ids)
         position_embeddings = (cos, sin)
