@@ -119,7 +119,7 @@ correct = 0
 total = 0
 results = []
 
-for i in tqdm(range(0, len(rows), BATCH_SIZE)):
+for i in tqdm(range(0, 20, BATCH_SIZE)):
     batch = rows[i : i + BATCH_SIZE]
 
     prompts = [format_prompt(r) for r in batch]
