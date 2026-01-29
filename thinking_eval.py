@@ -12,9 +12,11 @@ from mlx_lm import load, generate, batch_generate
 # ============================================================
 parser = argparse.ArgumentParser(description="Evaluate model on MMLU abstract algebra with thinking budget")
 parser.add_argument("--model", type=str, default="/Users/rachittibrewal/Documents/airllm/sarvam_moe_sft-dwq", help="Path to the model to evaluate")
+parser.add_argument("--output-file", type=str, default=None, help="Path to save output results JSONL")
 args = parser.parse_args()
 
 MODEL_PATH = args.model
+OUTPUT_FILE = args.output_file
 
 BATCH_SIZE = 16           # safe for 4B on M2/M3
 THINKING_BUDGET = 512     # max tokens allowed for reasoning
@@ -101,6 +103,7 @@ model, tokenizer = load(
 # ============================================================
 correct = 0
 total = 0
+results = []
 
 for i in tqdm(range(0, len(rows), BATCH_SIZE)):
     batch = rows[i : i + BATCH_SIZE]
@@ -138,11 +141,24 @@ for i in tqdm(range(0, len(rows), BATCH_SIZE)):
     # --------------------------------------------------------
     # Scoring
     # --------------------------------------------------------
-    for output, gold in zip(answer_outputs, golds):
+    for j, (output, gold) in enumerate(zip(answer_outputs, golds)):
         pred = extract_answer(output)
-        if pred == gold:
+        is_correct = (pred == gold)
+        if is_correct:
             correct += 1
         total += 1
+        
+        # Save detailed results
+        if OUTPUT_FILE:
+            results.append({
+                "question": batch[j]['question'],
+                "prompt": prompts[j],
+                "thinking_output": thinking_outputs[j],
+                "answer_output": output,
+                "gold": gold,
+                "prediction": pred,
+                "correct": is_correct
+            })
 
 
 # ============================================================
@@ -154,3 +170,11 @@ print(f"\nAccuracy on MMLU Abstract Algebra")
 print(f"Model: {MODEL_PATH}")
 print(f"Accuracy: {accuracy:.4f}")
 print(f"Correct: {correct} / {total}")
+
+if OUTPUT_FILE and results:
+    import json
+    print(f"Saving {len(results)} results to {OUTPUT_FILE}...")
+    with open(OUTPUT_FILE, "w") as f:
+        for r in results:
+            f.write(json.dumps(r) + "\n")
+    print("Done.")
