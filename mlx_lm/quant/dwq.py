@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import glob
 import time
 import types
 from pathlib import Path
@@ -216,12 +217,34 @@ def load_data(
     max_seq_length: int,
     num_valid_samples: int = 32,
 ):
-    args = types.SimpleNamespace(
-        hf_dataset={
+    # Check if it's a local pattern
+    if any(char in data_path for char in "*?[]") or Path(data_path).exists():
+        files = glob.glob(data_path)
+        if not files:
+            raise ValueError(f"No files found for pattern {data_path}")
+
+        # Heuristic for format
+        first_file = files[0]
+        if first_file.endswith(".json") or first_file.endswith(".jsonl"):
+            loader_format = "json"
+        else:
+            loader_format = "parquet"
+
+        dataset_config = {
+            "path": loader_format,
+            "train_split": "train",
+            "valid_split": "train[:1]",
+            "config": {"data_files": files},
+        }
+    else:
+        dataset_config = {
             "path": data_path,
             "train_split": "train",
             "valid_split": "train[:1]",
-        },
+        }
+
+    args = types.SimpleNamespace(
+        hf_dataset=dataset_config,
         train=True,
         test=False,
     )
