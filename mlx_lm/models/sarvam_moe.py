@@ -167,13 +167,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
-def repeat_kv(x: mx.array, n_rep: int) -> mx.array:
-    if n_rep == 1:
-        return x
-    B, n_kv_heads, L, D = x.shape
-    x = mx.expand_dims(x, axis=2)
-    x = mx.repeat(x, n_rep, axis=2)
-    return x.reshape(B, n_kv_heads * n_rep, L, D)
+
 
 
 
@@ -250,9 +244,7 @@ class SarvamMoEAttention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        n_rep = self.n_heads // self.n_kv_heads
-        keys = repeat_kv(keys, n_rep)
-        values = repeat_kv(values, n_rep)
+
 
         # Output: (B, H, L, D)
         output = scaled_dot_product_attention(
