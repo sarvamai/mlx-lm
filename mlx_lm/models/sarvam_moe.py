@@ -91,84 +91,16 @@ class ModelArgs(BaseModelArgs):
                 self.rope_scaling = None
 
 
-class SarvamMoERotaryEmbedding(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.max_position_embeddings = args.max_position_embeddings
-        self.rope_theta = args.rope_theta
-        
-        # Calculate rope dimension
-        # Note: head_dim is usually set in args if not from hidden/heads
-        dim = args.head_dim or (args.hidden_size // args.num_attention_heads)
-        
-        inv_freq = 1.0 / (
-            self.rope_theta
-            ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-        )
-        self.inv_freq = inv_freq
-        self.attention_scaling = 1.0
 
-    def __call__(self, x: mx.array, position_ids: mx.array) -> Tuple[mx.array, mx.array]:
-        # position_ids: (1, L) or (B, L)
-        
-        inv_freq_expanded = self.inv_freq[None, :, None] # (1, D/2, 1)
-        position_ids_expanded = position_ids[:, None, :].astype(mx.float32) # (B, 1, L)
-        
-        # (1, D/2, 1) * (B, 1, L) -> (B, D/2, L)
-        freqs = inv_freq_expanded * position_ids_expanded
-        
-        # Transpose to (B, L, D/2)
-        freqs = freqs.transpose(0, 2, 1)
-        
-        # emb = cat(freqs, freqs) -> (B, L, D)
-        emb = mx.concatenate((freqs, freqs), axis=-1)
-        
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
-        
-        return cos, sin
+
+
+
+
 
 
 class SarvamMoERMSNorm(nn.RMSNorm):
     def __init__(self, dims: int, eps: float = 1e-6):
         super().__init__(dims, eps)
-
-# rotate_half logic
-def rotate_half(x):
-    D = x.shape[-1]
-    x1 = x[..., : D // 2]
-    x2 = x[..., D // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    # q, k: (B, H, L, D_full) - full head dimension
-    # cos, sin: (B, L, D_full) - full head dimension from SarvamMoERotaryEmbedding
-    
-    # Reshape for broadcasting: (B, L, D) -> (B, 1, L, D)
-    cos = cos[:, None, :, :]
-    sin = sin[:, None, :, :]
-    
-    # Get rotary dimension from cos (matching reference behavior)
-    rotary_dim = cos.shape[-1]
-    
-    # Split q and k into rotary and pass-through parts
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-        
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-    
-    # Concatenate back
-    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
-    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
-    
-    return q_embed, k_embed
-
-
-
-
 
 
 class SarvamMoEMLP(nn.Module):
@@ -207,6 +139,12 @@ class SarvamMoEAttention(nn.Module):
             self.query_layernorm = None
             self.key_layernorm = None
 
+        self.rope = nn.RoPE(
+            self.head_dim,
+            traditional=False,
+            base=args.rope_theta,
+        )
+
         self.dense = nn.Linear(self.n_heads * self.head_dim, dim, bias=args.use_bias)
 
     def __call__(
@@ -214,7 +152,6 @@ class SarvamMoEAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        position_embeddings: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -236,15 +173,13 @@ class SarvamMoEAttention(nn.Module):
             queries = self.query_layernorm(queries)
             keys = self.key_layernorm(keys)
 
-        # Apply RoPE using position_embeddings if provided
-        if position_embeddings is not None:
-             cos, sin = position_embeddings
-             queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
-
         if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
-
-
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
 
         # Output: (B, H, L, D)
         output = scaled_dot_product_attention(
@@ -440,12 +375,11 @@ class SarvamMoEDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        position_embeddings: Optional[Tuple[mx.array, mx.array]] = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         **kwargs,
     ) -> mx.array:
-        r = self.attention(self.input_layernorm(x), mask, cache, position_embeddings)
+        r = self.attention(self.input_layernorm(x), mask, cache)
         h = x + r
         
         r = self.mlp(self.post_attention_layernorm(h))
@@ -469,7 +403,6 @@ class SarvamMoEModel(nn.Module):
             SarvamMoEDecoderLayer(args, i) for i in range(args.num_hidden_layers)
         ]
         self.norm = SarvamMoERMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.rotary_emb = SarvamMoERotaryEmbedding(args)
 
     def __call__(
         self,
@@ -493,22 +426,11 @@ class SarvamMoEModel(nn.Module):
 
         all_router_logits = [] if output_router_logits else None
 
-        # position_ids: (1, L)
-        start = 0
-        if cache and cache[0] is not None:
-             start = cache[0].offset
-        L = h.shape[1]
-        position_ids = mx.arange(start, start + L).reshape(1, -1)
-        
-        cos, sin = self.rotary_emb(h, position_ids)
-        position_embeddings = (cos, sin)
-
         for layer, c in zip(self.layers, cache):
             h, router_logits = layer(
                 h, 
                 mask, 
                 c, 
-                position_embeddings, 
                 output_router_logits=output_router_logits
             )
             if output_router_logits and router_logits is not None:
@@ -592,12 +514,12 @@ class Model(SarvamMoEForCausalLM):
         keys_to_remove = [k for k in weights.keys() if "input_scale" in k or "weight_scale" in k]
         for k in keys_to_remove:
             weights.pop(k, None)
+        
+        # Remove inv_freq as it is now handled by nn.RoPE internal generation
+        if "model.rotary_emb.inv_freq" in weights:
+            weights.pop("model.rotary_emb.inv_freq")
 
-        # Add inv_freq if missing (it's often not in checkpoints but is a parameter in MLX RoPE)
-        if "model.rotary_emb.inv_freq" not in weights:
-            weights["model.rotary_emb.inv_freq"] = self.model.rotary_emb.inv_freq
 
-        # Remove unused weights
         # Reference uses 'word_embeddings' but we use 'embed_tokens' in MLX standard
         # So we might need to map 'model.word_embeddings.weight' -> 'model.embed_tokens.weight'
         if "model.word_embeddings.weight" in weights:
